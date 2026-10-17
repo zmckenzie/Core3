@@ -126,6 +126,8 @@ if [ "${CORE3_GDB}" = "1" ]; then
 set pagination off
 set confirm off
 set disable-randomization off
+set print thread-events off
+set print inferior-events off
 handle SIGPIPE nostop noprint pass
 handle SIGUSR1 nostop noprint pass
 run

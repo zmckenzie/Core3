@@ -99,6 +99,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         gdb \
         libatomic1 \
+        libboost-atomic1.83.0 \
         libboost-thread1.83.0 \
         libdb5.3t64 \
         libjemalloc2 \
