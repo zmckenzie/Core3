@@ -1,0 +1,14 @@
+# Force LF on files that are executed inside Docker/WSL, even when the repo is
+# cloned with Git for Windows (core.autocrlf=true). With CRLF these fail with
+# "bad interpreter" / "$'\r': command not found". C++ and Lua sources don't care,
+# so they are left as committed.
+swgemu text eol=lf
+*.sh text eol=lf
+docker/** text eol=lf
+docker-compose.yml text eol=lf
+.env.example text eol=lf
+.dockerignore text eol=lf
+MMOCoreORB/bin/conf/config.lua text eol=lf
+MMOCoreORB/sql/*.sql text eol=lf
+MMOCoreORB/bin/?core3* text eol=lf
+*.bat text eol=crlf

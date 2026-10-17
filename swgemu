@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+#
+# One-command build & run for the Core3 server on Docker (Docker Desktop + WSL2,
+# or any Linux with Docker). Run `./swgemu help` for commands.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${ROOT}"
+
+ENV_FILE="${ROOT}/.env"
+TRE_STAGING="${ROOT}/.tre-download"
+CONFIG_LUA="${ROOT}/MMOCoreORB/bin/conf/config.lua"
+GDOWN_VERSION=5.2.0
+ENGINE3_URL=https://github.com/swgemu/engine3.git
+
+if [ -t 1 ]; then
+    C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_RED=$'\033[31m' C_CYAN=$'\033[36m'
+else
+    C_RESET='' C_BOLD='' C_GREEN='' C_YELLOW='' C_RED='' C_CYAN=''
+fi
+
+step()  { echo "${C_BOLD}${C_CYAN}==>${C_RESET}${C_BOLD} $*${C_RESET}"; }
+ok()    { echo "  ${C_GREEN}✔${C_RESET} $*"; }
+info()  { echo "    $*"; }
+warn()  { echo "  ${C_YELLOW}!${C_RESET} $*" >&2; }
+die()   { echo "${C_RED}${C_BOLD}ERROR:${C_RESET} $*" >&2; exit 1; }
+
+is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+
+compose() { docker compose --project-directory "${ROOT}" "$@"; }
+
+# --- .env handling (parsed, never sourced: values may contain backslashes) ----
+
+env_get() {
+    local key=$1 default=${2:-} val
+    val=$(sed -n "s/^${key}=//p" "${ENV_FILE}" 2>/dev/null | tail -n 1 | tr -d '\r')
+    val=${val%\"}; val=${val#\"}; val=${val%\'}; val=${val#\'}
+    echo "${val:-${default}}"
+}
+
+env_set() {
+    local key=$1 val=$2 tmp
+    tmp=$(mktemp)
+    if grep -q "^${key}=" "${ENV_FILE}"; then
+        K="${key}" V="${val}" awk 'index($0, ENVIRON["K"] "=") == 1 { print ENVIRON["K"] "=" ENVIRON["V"]; next } { print }' "${ENV_FILE}" > "${tmp}"
+    else
+        cat "${ENV_FILE}" > "${tmp}"
+        echo "${key}=${val}" >> "${tmp}"
+    fi
+    cat "${tmp}" > "${ENV_FILE}"
+    rm -f "${tmp}"
+}
+
+random_secret() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 16
+    else
+        (set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
+    fi
+}
+
+ensure_env() {
+    if [ ! -f "${ENV_FILE}" ]; then
+        cp "${ROOT}/.env.example" "${ENV_FILE}"
+        ok "Created .env from .env.example"
+    fi
+    local key
+    for key in DB_PASS DB_ROOT_PASS DB_SECRET; do
+        if [ -z "$(env_get "${key}")" ]; then
+            env_set "${key}" "$(random_secret)"
+            ok "Generated ${key}"
+        fi
+    done
+    chmod 600 "${ENV_FILE}"
+}
+
+# --- Preflight ----------------------------------------------------------------
+
+check_line_endings() {
+    local bad=()
+    local f
+    for f in swgemu docker/server/entrypoint.sh docker-compose.yml MMOCoreORB/bin/conf/config.lua; do
+        if [ -f "${f}" ] && grep -q $'\r' "${f}"; then
+            bad+=("${f}")
+        fi
+    done
+    if [ ${#bad[@]} -gt 0 ]; then
+        die "These files have Windows (CRLF) line endings: ${bad[*]}
+       This happens when the repo is cloned with Git for Windows. Fix it with:
+         git config --global core.autocrlf input
+         git rm -rq --cached . && git reset -q --hard
+       (or re-clone from inside WSL: cd ~ && git clone <repo-url>)"
+    fi
+}
+
+check_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        if is_wsl; then
+            die "The docker command is not available in this WSL distro.
+       Open Docker Desktop > Settings > Resources > WSL integration,
+       turn on integration for this distro ($(. /etc/os-release && echo "${NAME}")), click Apply & restart,
+       then open a new WSL terminal."
+        fi
+        die "docker is not installed. Install Docker Engine or Docker Desktop: https://docs.docker.com/get-docker/"
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        if is_wsl; then
+            die "Cannot reach Docker. Start Docker Desktop on Windows and wait for 'Engine running', then retry."
+        fi
+        die "Cannot reach the Docker daemon. Start it (sudo systemctl start docker) and check you are in the docker group."
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+        die "'docker compose' (Compose v2) is missing. Update Docker Desktop, or install the docker-compose-plugin package."
+    fi
+}
+
+check_resources() {
+    local mem_bytes mem_gb
+    mem_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
+    mem_gb=$(( mem_bytes / 1024 / 1024 / 1024 ))
+    if [ "${mem_gb}" -lt 6 ]; then
+        warn "Docker has only ${mem_gb}GB of memory. Compiling needs ~2GB per job and the server ~4GB."
+        if is_wsl; then
+            info "Give WSL more memory: create %UserProfile%\\.wslconfig on Windows containing"
+            info "    [wsl2]"
+            info "    memory=8GB"
+            info "then run 'wsl --shutdown' in PowerShell and restart Docker Desktop."
+        fi
+    else
+        ok "Docker memory: ${mem_gb}GB"
+    fi
+
+    local free_gb
+    free_gb=$(df -Pk "${ROOT}" | awk 'NR==2 { print int($4 / 1024 / 1024) }')
+    if [ "${free_gb}" -lt 15 ]; then
+        warn "Only ${free_gb}GB free here. TRE files (~3GB, plus the download) and the build cache need ~15GB."
+    else
+        ok "Disk space: ${free_gb}GB free"
+    fi
+}
+
+check_location() {
+    case "${ROOT}" in
+        /mnt/[a-z]/*)
+            warn "The repo is on the Windows filesystem (${ROOT})."
+            info "Builds from /mnt/c are many times slower. For best results clone it inside WSL:"
+            info "    cd ~ && git clone <repo-url> Core3 && cd Core3 && ./swgemu"
+            ;;
+    esac
+}
+
+ensure_engine3() {
+    if [ -f MMOCoreORB/utils/engine3/MMOEngine/CMakeLists.txt ]; then
+        return
+    fi
+    step "Fetching the engine3 submodule"
+    command -v git >/dev/null 2>&1 || die "git is required: sudo apt-get install -y git"
+    if [ -e .git ]; then
+        git submodule update --init --recursive
+    else
+        warn "Not a git checkout; cloning engine3 from ${ENGINE3_URL} (latest, not the pinned revision)."
+        rm -rf MMOCoreORB/utils/engine3
+        git clone --depth 1 "${ENGINE3_URL}" MMOCoreORB/utils/engine3
+    fi
+    [ -f MMOCoreORB/utils/engine3/MMOEngine/CMakeLists.txt ] || die "engine3 submodule is still missing."
+    ok "engine3 ready"
+}
+
+write_revision() {
+    # Shown in-game as the server revision. Only rewritten when it changes so
+    # the Docker build cache is not invalidated on every run.
+    local rev_file=MMOCoreORB/bin/conf/rev.txt new
+    [ -e .git ] && command -v git >/dev/null 2>&1 || return 0
+    new=$(git log --no-merges --pretty=format:'%h was %an, %as, message: %s' -10 2>/dev/null) || return 0
+    if [ ! -f "${rev_file}" ] || [ "$(cat "${rev_file}")" != "${new}" ]; then
+        printf '%s' "${new}" > "${rev_file}"
+    fi
+}
+
+cmd_doctor() {
+    step "Checking prerequisites"
+    check_line_endings
+    if is_wsl; then ok "Running in WSL ($(. /etc/os-release && echo "${PRETTY_NAME}"))"; fi
+    check_docker
+    ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null), $(docker compose version --short 2>/dev/null | sed 's/^/Compose /')"
+    check_resources
+    check_location
+    local tre_dir
+    tre_dir=$(resolve_tre_dir)
+    if tre_complete "${tre_dir}"; then
+        ok "TRE files: complete in ${tre_dir}"
+    else
+        warn "TRE files: $(tre_missing "${tre_dir}" | wc -l) missing in ${tre_dir} (./swgemu tre will fetch them)"
+    fi
+}
+
+# --- TRE files ----------------------------------------------------------------
+
+tre_list() {
+    sed -n '/TreFiles = {/,/}/p' "${CONFIG_LUA}" | grep -o '"[^"]*\.tre"' | tr -d '"'
+}
+
+tre_missing() {
+    local dir=$1 f
+    while read -r f; do
+        [ -s "${dir}/${f}" ] || echo "${f}"
+    done < <(tre_list)
+}
+
+tre_complete() { [ -z "$(tre_missing "$1")" ]; }
+
+resolve_tre_dir() {
+    local d
+    d=$(to_unix_path "$(env_get TRE_DIR ./tre)")
+    case "${d}" in
+        /*) echo "${d}" ;;
+        *) echo "${ROOT}/${d#./}" ;;
+    esac
+}
+
+to_unix_path() {
+    local p=$1
+    if [[ "${p}" =~ ^[A-Za-z]:[\\/] ]]; then
+        if command -v wslpath >/dev/null 2>&1; then
+            wslpath -u "${p}"
+            return
+        fi
+        local drive=${p:0:1}
+        p=${p:2}
+        p=${p//\\//}
+        echo "/mnt/${drive,,}${p}"
+        return
+    fi
+    echo "${p}"
+}
+
+download_from_drive() {
+    local url=$1 out=$2
+    local mode=(--fuzzy "${url}" -O /out/)
+    [[ "${url}" == */folders/* ]] && mode=(--folder "${url}" -O /out)
+    step "Downloading TRE archive from Google Drive"
+    info "${url}"
+    if command -v curl >/dev/null 2>&1 &&
+        curl -sSL -o /dev/null -w '%{url_effective}' "${url}" 2>/dev/null | grep -q '^https://accounts\.google\.com/'; then
+        die "That Google Drive link is private (it asks for a Google sign-in).
+       Whoever owns it: Share > General access > 'Anyone with the link' (Viewer).
+       Or download the TAR in your browser and run:  ./swgemu tre 'C:\\Users\\<you>\\Downloads\\<file>.tar'"
+    fi
+    info "(the folder/file must be shared as 'Anyone with the link'; ~3GB, this can take a while)"
+    mkdir -p "${out}"
+    local tty=()
+    [ -t 1 ] && tty=(-t)
+    docker run --rm "${tty[@]}" \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp/home \
+        -v "${out}:/out" \
+        python:3.12-slim \
+        sh -c "pip install --quiet --disable-pip-version-check --user gdown==${GDOWN_VERSION} && python -m gdown $(printf '%q ' "${mode[@]}")" \
+        || die "Google Drive download failed. If Drive says the quota is exceeded or access is denied,
+       download the TAR in your browser and run:  ./swgemu tre 'C:\\Users\\<you>\\Downloads\\<file>.tar'"
+}
+
+download_url() {
+    local url=$1 out=$2
+    step "Downloading ${url}"
+    mkdir -p "${out}"
+    if command -v curl >/dev/null 2>&1; then
+        (cd "${out}" && curl -fL --retry 3 -O -J "${url}") || die "Download failed: ${url}"
+    else
+        (cd "${out}" && wget --content-disposition "${url}") || die "Download failed: ${url}"
+    fi
+}
+
+extract_archive() {
+    local archive=$1 dest=$2
+    mkdir -p "${dest}"
+    info "Extracting $(basename "${archive}")"
+    case "${archive,,}" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -q -o "${archive}" -d "${dest}"
+            elif command -v python3 >/dev/null 2>&1; then
+                python3 -I -m zipfile -e "${archive}" "${dest}"
+            else
+                die "Need unzip to extract ${archive}: sudo apt-get install -y unzip"
+            fi
+            ;;
+        *.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz)
+            tar -xf "${archive}" -C "${dest}" --no-same-owner
+            ;;
+        *.tre)
+            cp -f "${archive}" "${dest}/"
+            ;;
+        *)
+            die "Don't know how to extract ${archive} (expected .tar, .tar.gz or .zip)"
+            ;;
+    esac
+}
+
+collect_tre() {
+    local from=$1 to=$2 how=$3 count=0 f
+    mkdir -p "${to}"
+    while IFS= read -r -d '' f; do
+        if [ "${how}" = move ]; then mv -f "${f}" "${to}/"; else cp -f "${f}" "${to}/"; fi
+        count=$((count + 1))
+    done < <(find "${from}" -type f -iname '*.tre' -print0)
+    info "Collected ${count} .tre file(s) into ${to}"
+}
+
+cmd_tre() {
+    local tre_dir source
+    tre_dir=$(resolve_tre_dir)
+    source=${1:-$(env_get TRE_SOURCE)}
+
+    step "Checking TRE files in ${tre_dir}"
+    if [ -z "${1:-}" ] && tre_complete "${tre_dir}"; then
+        ok "All $(tre_list | wc -l) TRE files present"
+        return
+    fi
+    if [ -z "${source}" ]; then
+        [ -t 0 ] || die "TRE files are missing and TRE_SOURCE is not set in .env."
+        echo "  The server needs the client .tre files. Paste where to get them:"
+        echo "    a Google Drive link to the TRE archive (shared as 'Anyone with the link'),"
+        printf '%s\n' '    a .tar/.tar.gz/.zip path (e.g. C:\Users\you\Downloads\tre.tar), or an SWG client folder.'
+        read -r -p "  TRE source: " source
+        [ -n "${source}" ] || die "No TRE source given."
+        env_set TRE_SOURCE "${source}"
+        ok "Saved TRE_SOURCE to .env (not committed)"
+    fi
+
+    rm -rf "${TRE_STAGING}"
+    mkdir -p "${TRE_STAGING}/download" "${TRE_STAGING}/extract"
+
+    local local_path
+    local_path=$(to_unix_path "${source}")
+
+    if [[ "${source}" =~ ^https?://(drive|docs)\.google\.com/ ]]; then
+        download_from_drive "${source}" "${TRE_STAGING}/download"
+    elif [[ "${source}" =~ ^https?:// ]]; then
+        download_url "${source}" "${TRE_STAGING}/download"
+    elif [ -d "${local_path}" ]; then
+        step "Copying TRE files from ${local_path}"
+        collect_tre "${local_path}" "${tre_dir}" copy
+    elif [ -f "${local_path}" ]; then
+        extract_archive "${local_path}" "${TRE_STAGING}/extract"
+    else
+        die "TRE source not found: ${source}${local_path:+ (looked for ${local_path})}"
+    fi
+
+    local archive
+    while IFS= read -r -d '' archive; do
+        case "${archive,,}" in
+            *.zip|*.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.tre)
+                extract_archive "${archive}" "${TRE_STAGING}/extract" ;;
+            *)
+                info "Skipping $(basename "${archive}") (not an archive)" ;;
+        esac
+        rm -f "${archive}"
+    done < <(find "${TRE_STAGING}/download" -type f -print0)
+
+    if [ -n "$(ls -A "${TRE_STAGING}/extract")" ]; then
+        collect_tre "${TRE_STAGING}/extract" "${tre_dir}" move
+    fi
+    rm -rf "${TRE_STAGING}"
+
+    local missing
+    missing=$(tre_missing "${tre_dir}")
+    if [ -n "${missing}" ]; then
+        die "Still missing $(echo "${missing}" | wc -l) TRE file(s) in ${tre_dir}:
+$(echo "${missing}" | head -10 | sed 's/^/         /')"
+    fi
+    ok "All $(tre_list | wc -l) TRE files present in ${tre_dir}"
+}
+
+# --- Build / run --------------------------------------------------------------
+
+cmd_build() {
+    local args=()
+    [ "${1:-}" = "--clean" ] && args+=(--no-cache)
+    ensure_env
+    ensure_engine3
+    write_revision
+    step "Building the core3 image (first build: 20-60 minutes, later builds reuse the compile cache)"
+    compose build "${args[@]}" core3
+    ok "Build complete"
+}
+
+container_id() { compose ps -q "$1" 2>/dev/null; }
+
+wait_ready() {
+    local cid state health last="" deadline=$(( SECONDS + 45 * 60 ))
+    step "Starting the server (first start builds navmeshes and can take 10+ minutes)"
+    info "Ctrl-C stops waiting; the server keeps running in the background."
+    while [ ${SECONDS} -lt ${deadline} ]; do
+        cid=$(container_id core3)
+        [ -n "${cid}" ] || die "core3 container is not running. See: ./swgemu logs"
+        state=$(docker inspect -f '{{.State.Status}}' "${cid}")
+        health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "${cid}")
+        if [ "${health}" = healthy ]; then
+            ok "Server is up"
+            return 0
+        fi
+        if [ "${state}" = exited ] || [ "${state}" = restarting ] || [ "${health}" = unhealthy ]; then
+            compose logs --tail=60 --no-log-prefix core3 >&2 || true
+            die "core3 stopped during startup (state: ${state}). Full log: ./swgemu logs"
+        fi
+        local line
+        line=$(compose logs --tail=1 --no-log-prefix core3 2>/dev/null | tr -d '\r' | cut -c1-110)
+        if [ -n "${line}" ] && [ "${line}" != "${last}" ]; then
+            info "${line}"
+            last=${line}
+        fi
+        sleep 5
+    done
+    warn "Still starting after 45 minutes; check ./swgemu logs"
+}
+
+print_connect_info() {
+    local addr name admins
+    addr=$(env_get GALAXY_ADDRESS 127.0.0.1)
+    name=$(env_get GALAXY_NAME Core3)
+    admins=$(env_get CORE3_ADMINS)
+    echo
+    echo "${C_BOLD}${C_GREEN}Galaxy '${name}' is running.${C_RESET}"
+    echo "  Point the SWG client at it: in the client folder's login.cfg (or swgemu_login.cfg) set"
+    echo "      loginServerAddress0=${addr}"
+    echo "      loginServerPort0=44453"
+    echo "  Accounts are created automatically on first login."
+    if [ -z "${admins}" ]; then
+        echo "  Make yourself admin after your first login:  ./swgemu admin <account>"
+    fi
+    echo "  Console: ./swgemu console    Logs: ./swgemu logs    Stop: ./swgemu stop"
+}
+
+cmd_up() {
+    cmd_doctor
+    ensure_env
+    cmd_tre
+    cmd_build
+    step "Starting containers"
+    compose up -d --remove-orphans
+    wait_ready
+    print_connect_info
+}
+
+cmd_stop() {
+    step "Stopping (the server saves the world first; this can take a minute)"
+    compose stop
+    ok "Stopped. Start again with ./swgemu up"
+}
+
+cmd_down() {
+    step "Stopping and removing containers (world data and database are kept)"
+    compose down
+}
+
+cmd_restart() {
+    compose restart core3
+    wait_ready
+}
+
+cmd_logs() { compose logs -f --tail="${1:-200}" core3; }
+
+cmd_console() {
+    local cid
+    cid=$(container_id core3)
+    [ -n "${cid}" ] || die "Server is not running. Start it with ./swgemu up"
+    echo "${C_BOLD}Attached to the Core3 console.${C_RESET} Try: help, save, broadcast <text>, shutdown <minutes>"
+    echo "Press ${C_BOLD}Ctrl-C${C_RESET} to detach (the server keeps running)."
+    docker attach --detach-keys=ctrl-c "${cid}" || true
+}
+
+cmd_cmd() {
+    [ $# -gt 0 ] || die "Usage: ./swgemu cmd <console command>   e.g. ./swgemu cmd save"
+    [ -n "$(container_id core3)" ] || die "Server is not running."
+    compose exec -T core3 bash -c 'printf "%s\n" "$1" > /tmp/core3-console' _ "$*"
+    ok "Sent '$*'. Output:"
+    timeout 5 docker compose --project-directory "${ROOT}" logs -f --since=2s --no-log-prefix core3 || true
+}
+
+db_root() {
+    local tty=()
+    [ -t 0 ] && tty=(-it) || tty=(-T)
+    compose exec "${tty[@]}" -e MYSQL_PWD="$(env_get DB_ROOT_PASS)" db mariadb -uroot swgemu "$@"
+}
+
+cmd_admin() {
+    [ $# -eq 1 ] || die "Usage: ./swgemu admin <account name>"
+    local name=$1 rows
+    [[ "${name}" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Invalid account name: ${name}"
+    rows=$(db_root -N -e "UPDATE accounts SET admin_level = 15 WHERE username = '${name}'; SELECT ROW_COUNT();" </dev/null | tail -n 1)
+    if [ "${rows}" = 0 ]; then
+        if db_root -N -e "SELECT 1 FROM accounts WHERE username = '${name}'" </dev/null | grep -q 1; then
+            ok "${name} is already an admin."
+        else
+            die "No account named '${name}' yet. Log in with the client once to create it, then rerun."
+        fi
+    else
+        ok "${name} now has admin level 15 (relog to take effect)."
+    fi
+}
+
+cmd_status() {
+    compose ps
+    echo
+    if [ -n "$(container_id db)" ]; then
+        db_root -t -e "SELECT galaxy_id, name, address, port FROM galaxy; SELECT COUNT(*) AS accounts FROM accounts;" </dev/null || true
+    fi
+}
+
+cmd_backup() {
+    local dest was_running=false
+    dest="${ROOT}/backups/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "${dest}"
+    if [ -n "$(container_id core3)" ]; then
+        was_running=true
+        step "Stopping core3 for a consistent backup"
+        compose stop core3
+    fi
+    step "Backing up to ${dest}"
+    db_root -e "SELECT 1" </dev/null >/dev/null || compose up -d db
+    compose exec -T -e MYSQL_PWD="$(env_get DB_ROOT_PASS)" db mariadb-dump -uroot --databases swgemu > "${dest}/swgemu.sql"
+    ok "Database -> swgemu.sql"
+    compose run --rm --no-deps -T --user "$(id -u):$(id -g)" -v "${dest}:/backup" --entrypoint tar core3 \
+        -czf /backup/world-databases.tar.gz -C /opt/core3/bin databases
+    ok "World objects -> world-databases.tar.gz"
+    if ${was_running}; then
+        compose start core3
+        ok "core3 restarted"
+    fi
+}
+
+cmd_reset() {
+    echo "${C_RED}${C_BOLD}This deletes the database (all accounts and characters) and the whole world state.${C_RESET}"
+    echo "TRE files and your .env are kept. Consider ./swgemu backup first."
+    read -r -p "Type RESET to continue: " answer
+    [ "${answer}" = RESET ] || die "Cancelled."
+    compose down -v
+    ok "Everything wiped. Run ./swgemu up to start fresh."
+}
+
+cmd_update() {
+    step "Updating source"
+    git pull --ff-only
+    git submodule update --init --recursive
+    cmd_up
+}
+
+cmd_help() {
+    cat <<EOF
+${C_BOLD}Usage:${C_RESET} ./swgemu [command]
+
+  ${C_BOLD}up${C_RESET}             (default) check prerequisites, fetch TRE files, build, start, wait until ready
+  stop           stop the server cleanly (saves the world)
+  down           stop and remove containers (keeps data)
+  restart        restart core3
+  logs [N]       follow the server log (last N lines, default 200)
+  console        attach to the server console (Ctrl-C detaches)
+  cmd <command>  send one console command, e.g. ./swgemu cmd save
+  admin <name>   give an account admin level 15
+  status         container state, galaxy row and account count
+  build [--clean] rebuild the server image (--clean ignores the Docker cache)
+  tre [source]   fetch/verify TRE files (source: Drive link, .tar/.zip path, or client folder)
+  doctor         check Docker, memory, disk, line endings and TRE files
+  db             MariaDB shell on the swgemu database
+  shell          bash shell inside the core3 container
+  backup         dump database + world to ./backups/<timestamp>
+  update         git pull, then up
+  reset          delete ALL server data (asks for confirmation)
+
+Settings live in .env (created on first run from .env.example).
+EOF
+}
+
+main() {
+    local cmd=${1:-up}
+    [ $# -gt 0 ] && shift
+    case "${cmd}" in
+        up|start)  cmd_up ;;
+        stop)      check_docker; cmd_stop ;;
+        down)      check_docker; cmd_down ;;
+        restart)   check_docker; cmd_restart ;;
+        logs)      check_docker; cmd_logs "$@" ;;
+        console|attach) check_docker; cmd_console ;;
+        cmd)       check_docker; cmd_cmd "$@" ;;
+        admin)     check_docker; cmd_admin "$@" ;;
+        status|ps) check_docker; cmd_status ;;
+        build)     check_line_endings; check_docker; cmd_build "$@" ;;
+        tre)       ensure_env; cmd_tre "$@" ;;
+        doctor)    cmd_doctor ;;
+        db|mysql)  check_docker; db_root ;;
+        shell)     check_docker; compose exec core3 bash ;;
+        backup)    check_docker; cmd_backup ;;
+        update)    cmd_update ;;
+        reset)     check_docker; cmd_reset ;;
+        help|-h|--help) cmd_help ;;
+        *) cmd_help; die "Unknown command: ${cmd}" ;;
+    esac
+}
+
+main "$@"

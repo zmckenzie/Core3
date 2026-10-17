@@ -4,3 +4,10 @@ luacov.stats.out
 .DS_Store
 .cache
 compile_commands.json
+
+# ./swgemu docker setup
+/.env
+/tre/
+/.tre-download/
+/backups/
+/server-config/*.lua
