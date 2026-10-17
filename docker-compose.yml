@@ -1,0 +1,73 @@
+# SWGEmu Core3 server stack. Normally driven by ./swgemu (run ./swgemu help).
+# Settings come from .env, which ./swgemu creates on first run from .env.example.
+
+name: ${COMPOSE_PROJECT_NAME:-swgemu}
+
+services:
+  db:
+    image: mariadb:10.11
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASS:?run ./swgemu to generate .env}
+      MARIADB_DATABASE: swgemu
+      MARIADB_USER: swgemu
+      MARIADB_PASSWORD: ${DB_PASS:?run ./swgemu to generate .env}
+    volumes:
+      - db-data:/var/lib/mysql
+      # Loaded once, when db-data is first created.
+      - ./MMOCoreORB/sql/swgemu.sql:/docker-entrypoint-initdb.d/10-swgemu.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  core3:
+    build:
+      context: .
+      dockerfile: docker/server/Dockerfile
+      args:
+        BUILD_TYPE: ${BUILD_TYPE:-RelWithDebInfo}
+        BUILD_JOBS: ${BUILD_JOBS:-}
+        CMAKE_EXTRA_ARGS: ${CMAKE_EXTRA_ARGS:-}
+    image: ${COMPOSE_PROJECT_NAME:-swgemu}-core3:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: swgemu
+      DB_USER: swgemu
+      DB_PASS: ${DB_PASS}
+      DB_SECRET: ${DB_SECRET:?run ./swgemu to generate .env}
+      GALAXY_NAME: ${GALAXY_NAME:-Core3}
+      GALAXY_ADDRESS: ${GALAXY_ADDRESS:-127.0.0.1}
+      CORE3_ADMINS: ${CORE3_ADMINS:-}
+      CORE3_GDB: ${CORE3_GDB:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-4}
+    # Console: ./swgemu console (Ctrl-C detaches) or ./swgemu cmd "<command>"
+    stdin_open: true
+    tty: true
+    init: true
+    # A clean shutdown saves every object to bin/databases; give it time.
+    stop_grace_period: 3m
+    ports:
+      - "${BIND_IP:-0.0.0.0}:44453:44453/udp" # login
+      - "${BIND_IP:-0.0.0.0}:44462:44462/udp" # ping
+      - "${BIND_IP:-0.0.0.0}:44463:44463/udp" # zone
+      - "${BIND_IP:-0.0.0.0}:44455:44455/tcp" # status
+    volumes:
+      - ${TRE_DIR:-./tre}:/tre:ro
+      - ./server-config:/opt/core3/config.d:ro
+      - core3-databases:/opt/core3/bin/databases
+      - core3-navmeshes:/opt/core3/bin/navmeshes
+      - core3-logs:/opt/core3/bin/log
+
+volumes:
+  db-data:
+  core3-databases:
+  core3-navmeshes:
+  core3-logs:

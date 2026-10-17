@@ -12,69 +12,136 @@ The SWGEmu project is not only a nostalgic journey for passionate players but al
 
 If you have any questions, need support, or want to contribute to the SWGEmu project, please refer to the documentation and resources provided in this repository.
 
-## Docker Build
+## Quick Start: Docker (Windows + WSL2 + Docker Desktop, or Linux)
 
-If you have docker (i.e. Linux docker daemon, Windows/MacOS [Docker Desktop](https://www.docker.com/products/docker-desktop/)) you can run the entire development environment and server in a container.
+One command builds the server from this checkout and runs it with its database:
 
-### Setup
+```
+./swgemu
+```
 
-The docker build creates a container that includes everything needed to run the core3 engine except you need the tre files from the client.
+It checks your setup, downloads the client `.tre` files, compiles Core3 in a container, starts
+MariaDB and the server, waits until the galaxy is up, and prints how to connect.
 
-The setup assumes you've copied your tre files to the docker volume 'shared-tre' and in the container they're mounted in /tre/
+### One-time setup on Windows
 
-On linux or macos you can easily create this volume by doing:
+1. **Install WSL2 with Ubuntu.** In PowerShell (as Administrator): `wsl --install -d Ubuntu`, then reboot
+   and create your Linux user when Ubuntu opens.
+2. **Install [Docker Desktop](https://www.docker.com/products/docker-desktop/).** In *Settings → Resources →
+   WSL integration*, turn on your Ubuntu distro, then *Apply & restart*.
+3. **Give WSL enough memory** (recommended 8GB+). Create `%UserProfile%\.wslconfig` containing:
+   ```
+   [wsl2]
+   memory=8GB
+   ```
+   then run `wsl --shutdown` in PowerShell and restart Docker Desktop.
+4. **Clone inside WSL, not under `C:\`.** Open Ubuntu and run:
+   ```
+   sudo apt-get update && sudo apt-get install -y git
+   cd ~
+   git clone --recurse-submodules https://github.com/zmckenzie/Core3.git
+   cd Core3
+   ./swgemu
+   ```
+   Building from `/mnt/c/...` works, but it is several times slower.
+
+The first build takes 20–60 minutes depending on your CPU. Later builds reuse a compile cache and
+only rebuild what changed. The first server start also builds navmeshes, which takes a while.
+
+### TRE files
+
+The server needs the 51 `.tre` files from a Star Wars Galaxies client. `./swgemu` puts them in `./tre`.
+If any are missing, the first run asks where to get them and saves the answer as `TRE_SOURCE` in `.env`.
+That file is git-ignored, so links are never committed. Ask whoever runs the server for the link to the TRE
+archive (a Google Drive file shared as *Anyone with the link*, about 3GB), or use files you already have:
+
+```
+./swgemu tre 'https://drive.google.com/file/d/<id>/view'   # a shared Google Drive file
+./swgemu tre 'C:\Users\you\Downloads\tre.tar'     # a .tar/.tar.gz/.zip (Windows paths work)
+./swgemu tre /mnt/c/SWGEmu                         # an installed client folder
+```
+
+If Google Drive refuses the download ("quota exceeded"), download the TAR in your browser and use the
+first form above.
+
+### Connecting
+
+Edit `login.cfg` (or `swgemu_login.cfg`) in the client folder:
+
+```
+[ClientGame]
+loginServerAddress0=127.0.0.1
+loginServerPort0=44453
+```
+
+Accounts are created on first login. To make your account an admin, log in once, then run
+`./swgemu admin <account>`.
+
+**Playing with friends on your LAN or the internet:** set `GALAXY_ADDRESS` in `.env` to this PC's LAN IP
+(from `ipconfig`) or your public IP, then run `./swgemu up`. Allow UDP 44453, 44462 and 44463 through Windows
+Firewall (and forward them on your router for internet play). Friends use that address in their `login.cfg`.
+
+### Everyday commands
+
+| Command | What it does |
+| --- | --- |
+| `./swgemu` / `./swgemu up` | Build if needed, start, wait until ready |
+| `./swgemu stop` | Clean shutdown (saves the world first) |
+| `./swgemu logs` | Follow the server log |
+| `./swgemu console` | Attach to the server console (Ctrl-C detaches, the server keeps running) |
+| `./swgemu cmd save` | Send a single console command |
+| `./swgemu admin <name>` | Give an account admin level 15 |
+| `./swgemu status` | Containers, galaxy row, account count |
+| `./swgemu update` | `git pull`, then rebuild and restart |
+| `./swgemu backup` | Database dump + world objects into `./backups/` |
+| `./swgemu doctor` | Diagnose Docker, memory, disk, line endings, TRE files |
+| `./swgemu reset` | Delete all accounts, characters and world state |
+
+Settings (galaxy name and address, admins, build type, log level) are in `.env`. Server config overrides go
+in `server-config/*.lua` (see [server-config/README.md](server-config/README.md)).
+
+### How it is put together
+
+* `docker-compose.yml` runs two services: `db` (MariaDB 10.11, which loads `MMOCoreORB/sql/swgemu.sql`
+  on first start) and `core3`.
+* `docker/server/Dockerfile` compiles engine3 and Core3 from **this checkout** with clang 19 on Ubuntu 24.04,
+  using ccache in a BuildKit cache mount, then copies the result into a slim runtime image.
+* `docker/server/entrypoint.sh` checks the TRE files, waits for the database, points the galaxy row at
+  `GALAXY_ADDRESS`, writes `conf/config-local.lua`, and runs core3 (under gdb by default, so crashes print a
+  backtrace). On `docker stop` it sends `exit` to the console so the world is saved before shutdown.
+* World data (`bin/databases`), navmeshes, logs and the database live in named Docker volumes, so they survive
+  rebuilds. `./swgemu reset` deletes them.
+
+### Troubleshooting
+
+* **`docker: command not found` or "Cannot reach Docker" in WSL:** `./swgemu` prints the likely cause. The usual fixes:
+  * Docker Desktop must be running and show *Engine running*.
+  * In Docker Desktop, *Settings → General → Use the WSL 2 based engine* must be on, and
+    *Settings → Resources → WSL integration* must be on for your distro. Click *Apply & restart*, then open a new WSL terminal.
+  * The distro must be WSL 2: in PowerShell, `wsl -l -v` must show `VERSION 2` (if not, run `wsl --set-version Ubuntu 2`).
+  * Don't install Docker inside the distro (`apt install docker.io` / `docker-ce`). It hides Docker Desktop's. Remove it with
+    `sudo apt-get remove docker.io docker-ce docker-ce-cli`, then run `wsl --shutdown` in PowerShell.
+  * "permission denied" on the socket: `sudo usermod -aG docker $USER`, then `wsl --shutdown`.
+  * `DOCKER_HOST` must not be set, and `docker context show` should print `default`.
+* **`bad interpreter` or `$'\r': command not found`:** the repo was cloned with Windows line endings. Clone
+  it from inside WSL, or run `git config --global core.autocrlf input && git rm -rq --cached . && git reset -q --hard`.
+* **Compiler killed / `signal 9` during build:** not enough memory. Raise `memory=` in `.wslconfig`, or set
+  `BUILD_JOBS=2` in `.env`.
+* **Client hangs at "connecting to server":** `GALAXY_ADDRESS` is not reachable from the client machine.
+
+## Docker Development Container (legacy)
+
+The original interactive development container is still in `docker/` (`docker/build.sh`, `docker/run.sh`).
+It clones the upstream `swgemu/Core3` repository into a volume rather than using this checkout, and expects
+the TRE files in a `shared-tre` Docker volume:
 
 ```
 $ cd ~/SWGEmu
-$ tar cf - *.tre | docker run -i --rm -v shared-tre:/tre debian:bullseye bash -c 'tar xvf - -C /tre'
-bottom.tre
-...
-patch_sku1_14_00.tre
+$ tar cf - *.tre | docker run -i --rm -v shared-tre:/tre debian:bookworm bash -c 'tar xvf - -C /tre'
+$ cd docker && ./build.sh && ./run.sh
 ```
 
-The docker container will use these files for your server in the container.
-
-### Build
-
-To build the container:
-
-```
-cd docker
-./build.sh
-```
-
-### Develop/Run
-
-Run the container with:
-
-```
-cd docker
-./run.sh
-```
-
-This runs the container and starts and interactive shell, in there you can work with the code (workspace/Core3), build and run the server.
-
-The first time you run the container it will setup the environment and defaults for the server, watch for it to tell you the mysql and admin passwords!
-
-When you're in the container you should have a ~/.my.cnf setup which allows you to easily talk to the mysql sever with the mysql command line client.
-
-All the local configuration is in workspace/Core3/MMOCoreORB/bin/conf/config-local.lua
-
-#### Compile the server
-
-Inside the container type:
-
-```
-build
-```
-
-#### Run the server
-
-Inside the container type:
-
-```
-run
-```
+Inside the container, `build` compiles the server and `run` starts it under gdb in screen.
 
 ## Windows Subsystem for Linux Setup
 

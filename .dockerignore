@@ -1,0 +1,20 @@
+# Build context for docker/server/Dockerfile (only MMOCoreORB and docker/server are used).
+**/.git
+.env
+tre/
+.tre-download/
+backups/
+server-config/
+linux/
+wsl2/
+MMOCoreORB/build/
+MMOCoreORB/src/autogen/
+MMOCoreORB/bin/core3
+MMOCoreORB/bin/core3client
+MMOCoreORB/bin/databases/*
+MMOCoreORB/bin/log/*.log
+MMOCoreORB/bin/navmeshes/*
+MMOCoreORB/bin/conf/config-local.lua
+MMOCoreORB/bin/screenlog*
+MMOCoreORB/utils/engine3/MMOEngine/build/
+MMOCoreORB/utils/engine3/MMOEngine/lib/unix/
