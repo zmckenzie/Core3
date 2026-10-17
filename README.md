@@ -114,7 +114,15 @@ in `server-config/*.lua` (see [server-config/README.md](server-config/README.md)
 
 ### Troubleshooting
 
-* **`docker: command not found` in WSL:** turn on WSL integration for your distro in Docker Desktop.
+* **`docker: command not found` or "Cannot reach Docker" in WSL:** `./swgemu` prints the likely cause. The usual fixes:
+  * Docker Desktop must be running and show *Engine running*.
+  * In Docker Desktop, *Settings → General → Use the WSL 2 based engine* must be on, and
+    *Settings → Resources → WSL integration* must be on for your distro. Click *Apply & restart*, then open a new WSL terminal.
+  * The distro must be WSL 2: in PowerShell, `wsl -l -v` must show `VERSION 2` (if not, run `wsl --set-version Ubuntu 2`).
+  * Don't install Docker inside the distro (`apt install docker.io` / `docker-ce`). It hides Docker Desktop's. Remove it with
+    `sudo apt-get remove docker.io docker-ce docker-ce-cli`, then run `wsl --shutdown` in PowerShell.
+  * "permission denied" on the socket: `sudo usermod -aG docker $USER`, then `wsl --shutdown`.
+  * `DOCKER_HOST` must not be set, and `docker context show` should print `default`.
 * **`bad interpreter` or `$'\r': command not found`:** the repo was cloned with Windows line endings. Clone
   it from inside WSL, or run `git config --global core.autocrlf input && git rm -rq --cached . && git reset -q --hard`.
 * **Compiler killed / `signal 9` during build:** not enough memory. Raise `memory=` in `.wslconfig`, or set

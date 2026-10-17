@@ -94,6 +94,51 @@ check_line_endings() {
     fi
 }
 
+# Explain why docker can't reach an engine from WSL. Docker Desktop shares its
+# engine with a distro through /mnt/wsl/docker-desktop when "WSL integration"
+# is on; the usual breakages are WSL1, a separately apt-installed docker
+# shadowing Desktop's CLI, socket permissions, or a stray DOCKER_HOST/context.
+diagnose_wsl_docker() {
+    local err=$1 docker_bin
+    docker_bin=$(readlink -f "$(command -v docker)" 2>/dev/null || command -v docker)
+    echo "${C_RED}${C_BOLD}ERROR:${C_RESET} Cannot reach Docker from WSL. Docker said:" >&2
+    echo "${err}" | head -3 | sed 's/^/       /' >&2
+    echo >&2
+    if grep -q Microsoft /proc/version && ! grep -qi 'microsoft-standard' /proc/version; then
+        die "This distro runs on WSL 1, and Docker Desktop only works with WSL 2.
+       In PowerShell:  wsl --set-version $(. /etc/os-release && echo "${NAME%% *}") 2   (see the name with: wsl -l -v)"
+    fi
+    if [ -n "${DOCKER_HOST:-}" ]; then
+        die "DOCKER_HOST is set to '${DOCKER_HOST}', which overrides Docker Desktop.
+       Remove it (check ~/.bashrc and ~/.profile), open a new terminal and retry."
+    fi
+    if [[ "${err}" == *"permission denied"* ]]; then
+        die "Your user may not use the Docker socket. Run:
+         sudo usermod -aG docker \$USER
+       then in PowerShell run 'wsl --shutdown' and open a new WSL terminal."
+    fi
+    if [ ! -d /mnt/wsl/docker-desktop ]; then
+        die "Docker Desktop is not connected to this distro. On Windows:
+         1. Start Docker Desktop and wait for 'Engine running'.
+         2. Settings > General: tick 'Use the WSL 2 based engine'.
+         3. Settings > Resources > WSL integration: turn on '$(. /etc/os-release && echo "${NAME}")', Apply & restart.
+         4. Open a new WSL terminal and run ./swgemu again."
+    fi
+    if [[ "${docker_bin}" != /mnt/wsl/docker-desktop/* ]]; then
+        die "This distro has its own Docker installed (${docker_bin}), which hides Docker Desktop's.
+       Remove it and restart WSL:
+         sudo apt-get remove -y docker.io docker-ce docker-ce-cli containerd.io docker-compose-plugin
+       then in PowerShell run 'wsl --shutdown', start Docker Desktop, and open a new WSL terminal."
+    fi
+    local ctx
+    ctx=$(docker context show 2>/dev/null || true)
+    if [ -n "${ctx}" ] && [ "${ctx}" != default ]; then
+        die "The docker context is '${ctx}'. Switch back with:  docker context use default"
+    fi
+    die "Docker Desktop is connected but its engine is not answering.
+       Open Docker Desktop and wait for 'Engine running' (or restart it: whale icon > Restart), then retry."
+}
+
 check_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         if is_wsl; then
@@ -104,11 +149,13 @@ check_docker() {
         fi
         die "docker is not installed. Install Docker Engine or Docker Desktop: https://docs.docker.com/get-docker/"
     fi
-    if ! docker info >/dev/null 2>&1; then
+    local err
+    if ! err=$(docker info 2>&1 >/dev/null); then
         if is_wsl; then
-            die "Cannot reach Docker. Start Docker Desktop on Windows and wait for 'Engine running', then retry."
+            diagnose_wsl_docker "${err}"
         fi
-        die "Cannot reach the Docker daemon. Start it (sudo systemctl start docker) and check you are in the docker group."
+        die "Cannot reach the Docker daemon: $(echo "${err}" | head -1)
+       Start it (sudo systemctl start docker) and check you are in the docker group."
     fi
     if ! docker compose version >/dev/null 2>&1; then
         die "'docker compose' (Compose v2) is missing. Update Docker Desktop, or install the docker-compose-plugin package."
